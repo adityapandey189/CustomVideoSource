@@ -6,10 +6,15 @@ import androidx.annotation.Nullable;
 import androidx.databinding.DataBindingUtil;
 
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ImageFormat;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
 import android.os.Bundle;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
@@ -18,6 +23,9 @@ import androidx.databinding.ViewDataBinding;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.provider.MediaStore;
+import android.renderscript.Allocation;
+import android.renderscript.RenderScript;
+import android.renderscript.ScriptIntrinsicYuvToRGB;
 import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -56,10 +64,14 @@ import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
 import org.webrtc.YuvConverter;
 
+import java.io.ByteArrayOutputStream;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.Executor;
 
@@ -73,9 +85,7 @@ import static io.socket.client.Socket.EVENT_CONNECT_ERROR;
 import static io.socket.client.Socket.EVENT_DISCONNECT;
 import static org.webrtc.SessionDescription.Type.ANSWER;
 import static org.webrtc.SessionDescription.Type.OFFER;
-
-import com.example.customvideosource.R;
-import com.example.customvideosource.SimpleSdpObserver;
+import android.renderscript.Element;
 
 public class MainActivity extends AppCompatActivity {
     private static final String TAG = "CompleteActivity";
@@ -111,13 +121,17 @@ public class MainActivity extends AppCompatActivity {
     private Handler messageHandler;
     private static final int MESSAGE_INTERVAL = 5000;
 
-    private static final int MAX_MESSAGE_SIZE = 65507;
+    private static final int MAX_MESSAGE_SIZE = 1024;
+    private int frameCounter = 0;
     private HandlerThread sendThread;
     private Handler sendHandler;
 
     private SurfaceView renderFrameView;
     private SurfaceHolder renderSurfaceHolder;
     private Paint paint = new Paint();
+
+    private Map<Integer, List<ByteBuffer>> frameChunks = new HashMap<>();
+    private Map<Integer, Integer> frameChunkCount = new HashMap<>();
 
 
     @Override
@@ -126,7 +140,7 @@ public class MainActivity extends AppCompatActivity {
         binding = DataBindingUtil.setContentView(this, R.layout.activity_main);
         setSupportActionBar(binding.toolbar);
         start();
-        renderFrameView = findViewById(R.id.surface_view);
+        renderFrameView = findViewById(R.id.renderFrame);
         renderSurfaceHolder = renderFrameView.getHolder();
         renderSurfaceHolder.setFormat(PixelFormat.TRANSLUCENT);
     }
@@ -185,7 +199,7 @@ public class MainActivity extends AppCompatActivity {
     private void connectToSignallingServer() {
         Log.d("method call", "connectToSignallingServer: ");
         try {
-            String URL = "http://192.168.214.20:8000";
+            String URL = "http://10.10.11.115:8000";
             Log.e(TAG, "REPLACE ME: IO Socket:" + URL);
             socket = IO.socket(URL);
 
@@ -429,26 +443,35 @@ public class MainActivity extends AppCompatActivity {
         if (localDataChannel.state() == DataChannel.State.OPEN) {
             Log.d("DataChannel", "DataChannel is open, sending video frame.");
 
+            frameCounter++;
+            int chunkIndex = 0;
+
             while (byteBuffer.remaining() > 0) {
-                int sizeToSend = Math.min(MAX_MESSAGE_SIZE, byteBuffer.remaining());
-                ByteBuffer chunk = byteBuffer.slice();
-                chunk.limit(sizeToSend);
+
+                int sizeToSend = Math.min(MAX_MESSAGE_SIZE - 8, byteBuffer.remaining());
+
+                ByteBuffer chunk = ByteBuffer.allocate(sizeToSend + 8);
+                chunk.putInt(frameCounter);
+                chunk.putInt(chunkIndex);
+                chunk.put((ByteBuffer) byteBuffer.slice().limit(sizeToSend));
+
+                chunk.flip();  // Prepare chunk for sending
+
+                // Attempt to send chunk
                 boolean sent = localDataChannel.send(new DataChannel.Buffer(chunk, false));
                 if (sent) {
                     Log.d("DataChannel", "Successfully sent a chunk of video frame.");
                 } else {
-                    Log.d("DataChannel", "Failed to send a chunk of video frame.");
-                    int retries = 0;
-                    while (retries < 3) {
-                        boolean reSend = localDataChannel.send(new DataChannel.Buffer(chunk, false));
-                        if (reSend) {
-                            Log.d("DataChannel", "Successfully sent a chunk of video frame.");
-                            break;
-                        }
-                        retries++;
+                    Log.d("DataChannel", "Failed to send a chunk, retrying...");
+                    // Retry sending chunk
+                    for (int retries = 0; retries < 3 && !sent; retries++) {
+                        sent = localDataChannel.send(new DataChannel.Buffer(chunk, false));
+                        if (sent) Log.d("DataChannel", "Chunk re-sent successfully.");
                     }
                 }
-                byteBuffer.position(byteBuffer.position() + sizeToSend);
+
+                byteBuffer.position(byteBuffer.position() + sizeToSend);  // Move to next chunk
+                chunkIndex++;
             }
         } else {
             Log.d("DataChannel", "DataChannel not open, unable to send video frame: " + localDataChannel.state());
@@ -630,94 +653,103 @@ public class MainActivity extends AppCompatActivity {
 
 
     private void processReceivedBuffer(DataChannel.Buffer buffer, int width, int height) {
-        if (buffer != null && buffer.data.remaining() > 0) {
-            ByteBuffer receivedBuffer = buffer.data;
-
-            int ySize = width * height;
-            int uSize = (width / 2) * (height / 2);
-            int vSize = uSize;
-
-            if (receivedBuffer.remaining() >= (ySize + uSize + vSize)) {
-                ByteBuffer yBuffer = ByteBuffer.allocateDirect(ySize);
-                ByteBuffer uBuffer = ByteBuffer.allocateDirect(uSize);
-                ByteBuffer vBuffer = ByteBuffer.allocateDirect(vSize);
-
-                receivedBuffer.get(yBuffer.array());
-                receivedBuffer.get(uBuffer.array());
-                receivedBuffer.get(vBuffer.array());
-
-
-                VideoFrame.I420Buffer i420Buffer = new VideoFrame.I420Buffer() {
-                    @Override
-                    public ByteBuffer getDataY() {
-                        return yBuffer;
-                    }
-
-                    @Override
-                    public ByteBuffer getDataU() {
-                        return uBuffer;
-                    }
-
-                    @Override
-                    public ByteBuffer getDataV() {
-                        return vBuffer;
-                    }
-
-                    @Override
-                    public int getStrideY() {
-                        return 0;
-                    }
-
-                    @Override
-                    public int getStrideU() {
-                        return 0;
-                    }
-
-                    @Override
-                    public int getStrideV() {
-                        return 0;
-                    }
-
-                    @Override
-                    public int getWidth() {
-                        return 0;
-                    }
-
-                    @Override
-                    public int getHeight() {
-                        return 0;
-                    }
-
-                    @Nullable
-                    @Override
-                    public VideoFrame.I420Buffer toI420() {
-                        return null;
-                    }
-
-                    @Override
-                    public void retain() {
-
-                    }
-
-                    @Override
-                    public void release() {
-                        // Handle release logic if needed
-                    }
-
-                    @Override
-                    public VideoFrame.Buffer cropAndScale(int i, int i1, int i2, int i3, int i4, int i5) {
-                        return null;
-                    }
-                };
-
-                VideoFrame videoFrame = new VideoFrame(i420Buffer, 0, System.nanoTime());
-                processReceivedVideoFrame(videoFrame);
-            } else {
-                Log.e("DataChannelReceived", "Received buffer does not contain enough data.");
-            }
-        } else {
+        if (buffer == null || buffer.data.remaining() == 0) {
             Log.d("DataChannelReceived", "Received buffer is null or empty.");
+            return;
         }
+
+        ByteBuffer receivedBuffer = buffer.data;
+
+        // Extract frame ID and chunk index from metadata
+        int frameId = receivedBuffer.getInt();
+        int chunkIndex = receivedBuffer.getInt();
+        ByteBuffer chunkData = receivedBuffer.slice();  // Extract chunk data
+
+        // Add chunk data to the list of chunks for this frame ID
+        frameChunks.computeIfAbsent(frameId, k -> new ArrayList<>()).add(chunkData);
+        frameChunkCount.put(frameId, frameChunkCount.getOrDefault(frameId, 0) + 1);
+
+        int expectedChunkCount = calculateExpectedChunkCount(width, height);  // Calculate expected chunks
+
+        // If all chunks for this frame are received, reassemble the frame
+        if (frameChunkCount.get(frameId) == expectedChunkCount) {
+            ByteBuffer completeFrame = ByteBuffer.allocateDirect(width * height * 3 / 2);  // YUV 420 size
+
+            for (ByteBuffer chunk : frameChunks.get(frameId)) {
+                completeFrame.put(chunk);  // Reassemble the chunks
+            }
+            completeFrame.flip();
+
+            // Process the complete frame
+            renderReassembledFrame(completeFrame, width, height);
+
+            // Cleanup after frame is processed
+            frameChunks.remove(frameId);
+            frameChunkCount.remove(frameId);
+        }
+    }
+
+    private int calculateExpectedChunkCount(int width, int height) {
+        int frameSize = width * height * 3 / 2;  // YUV 420 frame size
+        return (int) Math.ceil((double) frameSize / (MAX_MESSAGE_SIZE - 8));  // Minus metadata bytes
+    }
+
+    private void renderReassembledFrame(ByteBuffer completeFrame, int width, int height) {
+        int ySize = width * height;
+        int uSize = (width / 2) * (height / 2);
+        int vSize = uSize;
+
+        ByteBuffer yBuffer = ByteBuffer.allocateDirect(ySize);
+        ByteBuffer uBuffer = ByteBuffer.allocateDirect(uSize);
+        ByteBuffer vBuffer = ByteBuffer.allocateDirect(vSize);
+
+        completeFrame.get(yBuffer.array(), 0, ySize);
+        completeFrame.get(uBuffer.array(), 0, uSize);
+        completeFrame.get(vBuffer.array(), 0, vSize);
+
+        VideoFrame.I420Buffer i420Buffer = new VideoFrame.I420Buffer() {
+            @Override
+            public ByteBuffer getDataY() { return yBuffer; }
+
+            @Override
+            public ByteBuffer getDataU() { return uBuffer; }
+
+            @Override
+            public ByteBuffer getDataV() { return vBuffer; }
+
+            @Override
+            public int getStrideY() { return width; }
+
+            @Override
+            public int getStrideU() { return width / 2; }
+
+            @Override
+            public int getStrideV() { return width / 2; }
+
+            @Override
+            public int getWidth() { return width; }
+
+            @Override
+            public int getHeight() { return height; }
+
+            @Nullable
+            @Override
+            public VideoFrame.I420Buffer toI420() { return this; }
+
+            @Override
+            public void retain() {}
+
+            @Override
+            public void release() {}
+
+            @Override
+            public VideoFrame.Buffer cropAndScale(int x, int y, int cropWidth, int cropHeight, int scaleWidth, int scaleHeight) {
+                return null; // Implement if needed
+            }
+        };
+
+        VideoFrame videoFrame = new VideoFrame(i420Buffer, 0, System.nanoTime());
+        processReceivedVideoFrame(videoFrame);
     }
 
     private void processReceivedVideoFrame(VideoFrame videoFrame) {
@@ -746,17 +778,52 @@ public class MainActivity extends AppCompatActivity {
             }
         } finally {
             if (canvas != null) {
+                Log.d("RenderSurfaceHolder", "Rendering frame is not null");
                 renderSurfaceHolder.unlockCanvasAndPost(canvas);
             }
         }
     }
 
     private void drawYUVToRGB(Canvas canvas, ByteBuffer yBuffer, ByteBuffer uBuffer, ByteBuffer vBuffer, int width, int height) {
-        paint.setColor(Color.BLUE);
-        canvas.drawRect(0, 0, width, height, paint);
+        // Prepare a single buffer for YUV_420_888 format, concatenating Y, U, and V planes
+        byte[] yuvData = new byte[width * height * 3 / 2];
+        yBuffer.get(yuvData, 0, width * height);  // Copy Y plane
+        uBuffer.get(yuvData, width * height, width * height / 4);  // Copy U plane
+        vBuffer.get(yuvData, width * height + width * height / 4, width * height / 4);  // Copy V plane
+
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+
+        // Initialize Renderscript
+        RenderScript rs = RenderScript.create(this);  // Pass your app context
+        ScriptIntrinsicYuvToRGB yuvToRgbIntrinsic = ScriptIntrinsicYuvToRGB.create(rs, Element.U8_4(rs));
+
+        // Create Allocation for YUV and output Bitmap
+        Allocation yuvAllocation = Allocation.createSized(rs, Element.U8(rs), yuvData.length);
+        Allocation rgbAllocation = Allocation.createFromBitmap(rs, bitmap);
+
+        // Copy YUV byte data to input allocation
+        yuvAllocation.copyFrom(yuvData);
+
+        // Convert YUV to RGB
+        yuvToRgbIntrinsic.setInput(yuvAllocation);
+        yuvToRgbIntrinsic.forEach(rgbAllocation);
+
+        // Copy the RGB data to the Bitmap
+        rgbAllocation.copyTo(bitmap);
+
+        // Draw the bitmap on the canvas
+        if (bitmap != null) {
+            canvas.drawBitmap(bitmap, 0, 0, null);
+        } else {
+            Log.e("drawYUVToRGB", "Failed to convert YUV to RGB.");
+        }
+
+        // Clean up
+        yuvAllocation.destroy();
+        rgbAllocation.destroy();
+        yuvToRgbIntrinsic.destroy();
+        rs.destroy();
     }
-
-
 
 
     private VideoCapturer createVideoCapturer() {
